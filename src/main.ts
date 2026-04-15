@@ -81,6 +81,7 @@ async function bootstrap() {
     port: process.env.PORT ?? '3000',
     corsOrigins,
   });
-  await app.listen(process.env.PORT ?? 3000);
+  const port = parseInt(process.env.PORT ?? '3000', 10);
+  await app.listen(port, '0.0.0.0');
 }
 bootstrap();
