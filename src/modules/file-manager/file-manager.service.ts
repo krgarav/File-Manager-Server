@@ -169,7 +169,8 @@ export class FileManagerService {
 
     const account = await this.resolveAccountContext(workspace, pathValue, selector);
     const { drive } = await this.getWorkspaceDrive(ownerId, selector.userId, account.integration.id);
-    const currentFolderId = await this.resolvePathToFolderId(account, selector);
+    const folderContext = await this.resolvePathWithCanonical(account, selector);
+    const currentFolderId = folderContext.folderId;
 
     const listResponse = await drive.files.list({
       q: `'${currentFolderId}' in parents and trashed=false`,
@@ -177,10 +178,13 @@ export class FileManagerService {
       pageSize: 1000,
     });
 
-    const virtualPath = this.composeVirtualPath(account.accountFolderName, account.subPath);
+    const virtualPath = this.composeVirtualPath(account.accountFolderName, folderContext.canonicalSubPath);
     const files = (listResponse.data.files ?? []).map((item) => this.mapDriveItem(item, virtualPath));
 
-    const cwdName = account.subPath === '/' ? account.accountFolderName : this.getLeafName(account.subPath);
+    const cwdName =
+      folderContext.canonicalSubPath === '/'
+        ? account.accountFolderName
+        : this.getLeafName(folderContext.canonicalSubPath);
 
     return {
       cwd: {
@@ -450,7 +454,9 @@ export class FileManagerService {
       const segments = normalizedPath.split('/').filter(Boolean);
       const accountFolderName = this.getAccountFolderName(integration);
       const hasAccountPrefix =
-        segments[0] === integration.id || segments[0] === accountFolderName;
+        segments[0] === integration.id ||
+        segments[0] === accountFolderName ||
+        segments[0] === (integration.info || '').trim();
       const subSegments = hasAccountPrefix ? segments.slice(1) : segments;
       const subPath = subSegments.length ? `/${subSegments.join('/')}` : '/';
 
@@ -472,7 +478,8 @@ export class FileManagerService {
     const integration = linked.find(
       (item) =>
         item.id === accountSegment ||
-        this.getAccountFolderName(item) === accountSegment,
+        this.getAccountFolderName(item) === accountSegment ||
+        (item.info || '').trim() === accountSegment,
     );
 
     if (!integration) {
@@ -493,43 +500,55 @@ export class FileManagerService {
   }
 
   private async resolvePathToFolderId(account: AccountContext, selector: AccountSelector) {
+    const resolved = await this.resolvePathWithCanonical(account, selector);
+    return resolved.folderId;
+  }
+
+  private async resolvePathWithCanonical(account: AccountContext, selector: AccountSelector) {
     const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
     const rootName = this.getWorkspaceRootName(account.ownerId);
     const workspaceRoot = await this.ensureFolder(drive, 'root', rootName);
 
     if (account.subPath === '/') {
-      return workspaceRoot.id as string;
+      return { folderId: workspaceRoot.id as string, canonicalSubPath: '/' };
     }
 
     const segments = account.subPath.split('/').filter(Boolean);
     let currentParentId = workspaceRoot.id as string;
+    const canonicalSegments: string[] = [];
 
     for (const segment of segments) {
-      const folderId = await this.resolveFolderSegment(drive, currentParentId, segment);
-      if (!folderId) {
+      const folder = await this.resolveFolderSegment(drive, currentParentId, segment);
+      if (!folder) {
         throw new BadRequestException(`Folder not found: ${segment}`);
       }
-      currentParentId = folderId;
+      currentParentId = folder.id;
+      canonicalSegments.push(folder.name);
     }
 
-    return currentParentId;
+    return {
+      folderId: currentParentId,
+      canonicalSubPath: `/${canonicalSegments.join('/')}`,
+    };
   }
 
   private async resolveFolderSegment(
     drive: drive_v3.Drive,
     parentId: string,
     segment: string,
-  ): Promise<string | null> {
+  ): Promise<{ id: string; name: string } | null> {
     // Syncfusion can send either folder names or folder ids in path segments.
     try {
       const byId = await drive.files.get({
         fileId: segment,
-        fields: 'id,mimeType,parents,trashed',
+        fields: 'id,name,mimeType,parents,trashed',
       });
       const parentIds = byId.data.parents ?? [];
       const isFolder = byId.data.mimeType === 'application/vnd.google-apps.folder';
       if (!byId.data.trashed && isFolder && parentIds.includes(parentId)) {
-        return byId.data.id ?? null;
+        if (byId.data.id && byId.data.name) {
+          return { id: byId.data.id, name: byId.data.name };
+        }
       }
     } catch {
       // Not an id in this account context, fallback to name lookup.
@@ -537,7 +556,7 @@ export class FileManagerService {
 
     const byName = await this.findItemByName(drive, parentId, segment);
     if (byName?.id && byName.mimeType === 'application/vnd.google-apps.folder') {
-      return byName.id;
+      return { id: byName.id, name: byName.name ?? segment };
     }
 
     return null;
@@ -614,7 +633,10 @@ export class FileManagerService {
   }
 
   private getAccountFolderName(integration: LinkedIntegration) {
-    return (integration.info || '').trim() || `account-${integration.id.slice(-6)}`;
+    const email = (integration.info || '').trim().toLowerCase();
+    const emailSlug = email.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const suffix = integration.id.slice(-6).toLowerCase();
+    return emailSlug ? `drive-${emailSlug}-${suffix}` : `drive-account-${suffix}`;
   }
 
   private composeVirtualPath(accountFolderName: string, subPath: string) {
