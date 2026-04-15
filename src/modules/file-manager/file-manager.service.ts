@@ -22,6 +22,7 @@ type UploadedFile = {
 };
 
 type DriveItem = drive_v3.Schema$File;
+type AccountSelector = { userId?: string; integrationId?: string; email?: string };
 
 @Injectable()
 export class FileManagerService {
@@ -35,35 +36,35 @@ export class FileManagerService {
     );
   }
 
-  async fileOperations(workspace: string, body: OperationBody) {
+  async fileOperations(workspace: string, body: OperationBody, selector: AccountSelector = {}) {
     const action = (body?.action ?? '').toLowerCase();
 
     switch (action) {
       case 'read':
-        return this.read(workspace, body.path ?? '/');
+        return this.read(workspace, body.path ?? '/', selector);
       case 'create':
-        return this.createFolder(workspace, body.path ?? '/', body.name ?? 'New Folder');
+        return this.createFolder(workspace, body.path ?? '/', body.name ?? 'New Folder', selector);
       case 'delete':
-        return this.deleteItems(workspace, body.path ?? '/', this.getNamesFromBody(body));
+        return this.deleteItems(workspace, body.path ?? '/', this.getNamesFromBody(body), selector);
       case 'rename':
-        return this.renameItem(workspace, body.path ?? '/', body.name ?? '', body.newName ?? '');
+        return this.renameItem(workspace, body.path ?? '/', body.name ?? '', body.newName ?? '', selector);
       case 'copy':
-        return this.copyItems(workspace, body.path ?? '/', body.targetPath ?? '/', this.getNamesFromBody(body));
+        return this.copyItems(workspace, body.path ?? '/', body.targetPath ?? '/', this.getNamesFromBody(body), selector);
       case 'move':
-        return this.moveItems(workspace, body.path ?? '/', body.targetPath ?? '/', this.getNamesFromBody(body));
+        return this.moveItems(workspace, body.path ?? '/', body.targetPath ?? '/', this.getNamesFromBody(body), selector);
       case 'details':
-        return this.getDetails(workspace, body.path ?? '/', this.getNamesFromBody(body));
+        return this.getDetails(workspace, body.path ?? '/', this.getNamesFromBody(body), selector);
       default:
         throw new BadRequestException(`Unsupported action: ${body?.action}`);
     }
   }
 
-  async getImage(workspace: string, pathValue: string, id?: string) {
-    const { drive } = await this.getWorkspaceDrive(workspace);
+  async getImage(workspace: string, pathValue: string, id?: string, selector: AccountSelector = {}) {
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
 
     let fileId = id ?? '';
     if (!fileId) {
-      const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+      const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
       const name = this.getLeafName(pathValue);
       if (!name) {
         throw new BadRequestException('Image identifier is missing');
@@ -90,13 +91,13 @@ export class FileManagerService {
     };
   }
 
-  async saveUpload(workspace: string, pathValue: string, files: UploadedFile[]) {
+  async saveUpload(workspace: string, pathValue: string, files: UploadedFile[], selector: AccountSelector = {}) {
     if (!files?.length) {
       throw new BadRequestException('No files uploaded');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
 
     for (const file of files) {
       const safeName = (file.originalname || file.filename || 'file').trim();
@@ -117,16 +118,16 @@ export class FileManagerService {
       });
     }
 
-    return this.read(workspace, pathValue || '/');
+    return this.read(workspace, pathValue || '/', selector);
   }
 
-  async getDownloadStream(workspace: string, pathValue: string, names: string[]) {
+  async getDownloadStream(workspace: string, pathValue: string, names: string[], selector: AccountSelector = {}) {
     if (!names?.length) {
       throw new BadRequestException('No file selected for download');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
     const target = await this.findItemByName(drive, parentId, names[0]);
 
     if (!target?.id || target.mimeType === 'application/vnd.google-apps.folder') {
@@ -145,9 +146,9 @@ export class FileManagerService {
     };
   }
 
-  private async read(workspace: string, pathValue: string) {
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const currentFolderId = await this.resolvePathToFolderId(workspace, pathValue);
+  private async read(workspace: string, pathValue: string, selector: AccountSelector = {}) {
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const currentFolderId = await this.resolvePathToFolderId(workspace, pathValue, selector);
 
     const listResponse = await drive.files.list({
       q: `'${currentFolderId}' in parents and trashed=false`,
@@ -175,9 +176,9 @@ export class FileManagerService {
     };
   }
 
-  private async createFolder(workspace: string, pathValue: string, name: string) {
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+  private async createFolder(workspace: string, pathValue: string, name: string, selector: AccountSelector = {}) {
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
     const safeName = name.trim();
 
     if (!safeName) {
@@ -196,16 +197,16 @@ export class FileManagerService {
       });
     }
 
-    return this.read(workspace, pathValue);
+    return this.read(workspace, pathValue, selector);
   }
 
-  private async deleteItems(workspace: string, pathValue: string, names: string[]) {
+  private async deleteItems(workspace: string, pathValue: string, names: string[], selector: AccountSelector = {}) {
     if (!names.length) {
       throw new BadRequestException('No file or folder selected');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
 
     for (const name of names) {
       const item = await this.findItemByName(drive, parentId, name);
@@ -214,10 +215,10 @@ export class FileManagerService {
       }
     }
 
-    return this.read(workspace, pathValue);
+    return this.read(workspace, pathValue, selector);
   }
 
-  private async renameItem(workspace: string, pathValue: string, currentName: string, newName: string) {
+  private async renameItem(workspace: string, pathValue: string, currentName: string, newName: string, selector: AccountSelector = {}) {
     const safeCurrent = currentName.trim();
     const safeNew = newName.trim();
 
@@ -225,8 +226,8 @@ export class FileManagerService {
       throw new BadRequestException('Both current and new names are required');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
     const source = await this.findItemByName(drive, parentId, safeCurrent);
 
     if (!source?.id) {
@@ -239,17 +240,17 @@ export class FileManagerService {
       fields: 'id',
     });
 
-    return this.read(workspace, pathValue);
+    return this.read(workspace, pathValue, selector);
   }
 
-  private async copyItems(workspace: string, pathValue: string, targetPath: string, names: string[]) {
+  private async copyItems(workspace: string, pathValue: string, targetPath: string, names: string[], selector: AccountSelector = {}) {
     if (!names.length) {
       throw new BadRequestException('No file or folder selected');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const sourceParentId = await this.resolvePathToFolderId(workspace, pathValue);
-    const targetParentId = await this.resolvePathToFolderId(workspace, targetPath);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const sourceParentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const targetParentId = await this.resolvePathToFolderId(workspace, targetPath, selector);
 
     for (const name of names) {
       const item = await this.findItemByName(drive, sourceParentId, name);
@@ -271,17 +272,17 @@ export class FileManagerService {
       });
     }
 
-    return this.read(workspace, targetPath);
+    return this.read(workspace, targetPath, selector);
   }
 
-  private async moveItems(workspace: string, pathValue: string, targetPath: string, names: string[]) {
+  private async moveItems(workspace: string, pathValue: string, targetPath: string, names: string[], selector: AccountSelector = {}) {
     if (!names.length) {
       throw new BadRequestException('No file or folder selected');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const sourceParentId = await this.resolvePathToFolderId(workspace, pathValue);
-    const targetParentId = await this.resolvePathToFolderId(workspace, targetPath);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const sourceParentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const targetParentId = await this.resolvePathToFolderId(workspace, targetPath, selector);
 
     for (const name of names) {
       const item = await this.findItemByName(drive, sourceParentId, name);
@@ -297,16 +298,16 @@ export class FileManagerService {
       });
     }
 
-    return this.read(workspace, targetPath);
+    return this.read(workspace, targetPath, selector);
   }
 
-  private async getDetails(workspace: string, pathValue: string, names: string[]) {
+  private async getDetails(workspace: string, pathValue: string, names: string[], selector: AccountSelector = {}) {
     if (!names.length) {
       return { details: null, error: null };
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue);
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
     const item = await this.findItemByName(drive, parentId, names[0]);
 
     if (!item) {
@@ -329,12 +330,15 @@ export class FileManagerService {
     };
   }
 
-  private async getWorkspaceDrive(workspace: string) {
+  private async getWorkspaceDrive(workspace: string, selector: AccountSelector = {}) {
     const ownerId = this.normalizeWorkspace(workspace);
 
-    const integrationData = this.integrationService.getTokenOrApiKey({
+    const integrationData = await this.integrationService.getTokenOrApiKey({
       ownerId,
       type: 'GOOGLE_DRIVE',
+      userId: selector.userId,
+      integrationId: selector.integrationId,
+      email: selector.email,
     });
 
     this.oAuth2Client.setCredentials({
@@ -348,8 +352,8 @@ export class FileManagerService {
     };
   }
 
-  private async resolvePathToFolderId(workspace: string, pathValue: string) {
-    const { drive } = await this.getWorkspaceDrive(workspace);
+  private async resolvePathToFolderId(workspace: string, pathValue: string, selector: AccountSelector = {}) {
+    const { drive } = await this.getWorkspaceDrive(workspace, selector);
     const rootName = this.getWorkspaceRootName(workspace);
     const workspaceRoot = await this.ensureFolder(drive, 'root', rootName);
 

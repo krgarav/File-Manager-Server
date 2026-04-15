@@ -16,6 +16,7 @@ export interface SaveRedirectDto {
 
 export interface IntegrationRecord {
   ownerId: string;
+  userId: string;
   type: IntegrationType;
   tokens: {
     accessToken: string;
@@ -27,4 +28,5 @@ export interface IntegrationRecord {
   isActive: boolean;
   isDeleted: boolean;
   updatedAt: string;
+  id?: string;
 }

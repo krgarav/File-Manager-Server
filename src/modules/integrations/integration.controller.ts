@@ -24,15 +24,17 @@ export class IntegrationController {
   @Post('addcredentials')
   async addCredentials(
     @Query('workspace') workspace: string,
+    @Query('userId') userId: string,
     @Body() body: AddIntegrationDto,
   ) {
     const ownerId = this.required(workspace, 'workspace');
-    this.integrationService.enforceRateLimit(`${ownerId}:add-credentials`, 40, 60_000);
+    const normalizedUserId = this.optionalUserId(userId);
+    this.integrationService.enforceRateLimit(`${ownerId}:${normalizedUserId}:add-credentials`, 40, 60_000);
 
     this.integrationService.verifyType(body?.type);
 
     if (body.type === 'GOOGLE_DRIVE') {
-      const url = await this.googleDriveService.authorize(ownerId);
+      const url = await this.googleDriveService.authorize(ownerId, normalizedUserId);
       return { success: true, data: { url } };
     }
 
@@ -63,9 +65,10 @@ export class IntegrationController {
   }
 
   @Get('connected')
-  async getConnected(@Query('workspace') workspace: string) {
+  async getConnected(@Query('workspace') workspace: string, @Query('userId') userId?: string) {
     const ownerId = this.required(workspace, 'workspace');
-    const data = this.integrationService.getConnectedIntergrations(ownerId);
+    const normalizedUserId = this.optionalUserId(userId);
+    const data = await this.integrationService.getConnectedIntergrations(ownerId, normalizedUserId);
     return { success: true, data };
   }
 
@@ -76,6 +79,17 @@ export class IntegrationController {
     }
     if (normalized.length > 120) {
       throw new BadRequestException(`${name} is too long`);
+    }
+    return normalized;
+  }
+
+  private optionalUserId(userId?: string, fallback?: string): string {
+    const normalized = (userId ?? fallback ?? '').trim();
+    if (!normalized) {
+      throw new BadRequestException('userId is required');
+    }
+    if (normalized.length > 120) {
+      throw new BadRequestException('userId is too long');
     }
     return normalized;
   }

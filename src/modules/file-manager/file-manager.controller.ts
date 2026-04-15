@@ -32,8 +32,15 @@ export class FileManagerController {
   async fileOperations(
     @Query('workspace') workspace: string,
     @Body() body: Record<string, unknown>,
+    @Query('userId') userId?: string,
+    @Query('integrationId') integrationId?: string,
+    @Query('integrationEmail') integrationEmail?: string,
   ) {
-    return this.fileManagerService.fileOperations(this.requiredWorkspace(workspace), body);
+    return this.fileManagerService.fileOperations(
+      this.requiredWorkspace(workspace),
+      body,
+      this.selector(userId, integrationId, integrationEmail),
+    );
   }
 
   @Get('GetImage')
@@ -41,11 +48,15 @@ export class FileManagerController {
     @Query('workspace') workspace: string,
     @Query('path') pathValue: string,
     @Query('id') id: string,
+    @Query('userId') userId?: string,
+    @Query('integrationId') integrationId?: string,
+    @Query('integrationEmail') integrationEmail?: string,
   ) {
     const data = await this.fileManagerService.getImage(
       this.requiredWorkspace(workspace),
       pathValue,
       id,
+      this.selector(userId, integrationId, integrationEmail),
     );
 
     return new StreamableFile(data.stream as unknown as Readable, {
@@ -66,12 +77,16 @@ export class FileManagerController {
     @Query('path') pathQuery: string,
     @Body('path') pathBody: string,
     @UploadedFiles() files: UploadedFile[],
+    @Query('userId') userId?: string,
+    @Query('integrationId') integrationId?: string,
+    @Query('integrationEmail') integrationEmail?: string,
   ) {
     const pathValue = pathQuery ?? pathBody ?? '/';
     return this.fileManagerService.saveUpload(
       this.requiredWorkspace(workspace),
       pathValue,
       files ?? [],
+      this.selector(userId, integrationId, integrationEmail),
     );
   }
 
@@ -81,6 +96,9 @@ export class FileManagerController {
     @Query('workspace') workspace: string,
     @Body() body: { path?: string; names?: string[]; data?: Array<{ name?: string }> },
     @Res({ passthrough: true }) response: Response,
+    @Query('userId') userId?: string,
+    @Query('integrationId') integrationId?: string,
+    @Query('integrationEmail') integrationEmail?: string,
   ) {
     const names =
       body?.names && body.names.length
@@ -95,6 +113,7 @@ export class FileManagerController {
       this.requiredWorkspace(workspace),
       body?.path ?? '/',
       names,
+      this.selector(userId, integrationId, integrationEmail),
     );
 
     response.setHeader('Content-Disposition', `attachment; filename="${fileData.fileName}"`);
@@ -110,5 +129,13 @@ export class FileManagerController {
       throw new BadRequestException('workspace is too long');
     }
     return normalized;
+  }
+
+  private selector(userId?: string, integrationId?: string, integrationEmail?: string) {
+    return {
+      userId: userId?.trim() || undefined,
+      integrationId: integrationId?.trim() || undefined,
+      email: integrationEmail?.trim() || undefined,
+    };
   }
 }

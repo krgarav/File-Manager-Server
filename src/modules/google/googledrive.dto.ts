@@ -7,5 +7,6 @@ export interface GoogleTokenResult {
 
 export interface GoogleCreateTokenInput {
   ownerId: string;
+  userId: string;
   code: string;
 }

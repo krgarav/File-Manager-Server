@@ -3,13 +3,15 @@ import {
   HttpException,
   HttpStatus,
   Injectable,
+  InternalServerErrorException,
+  Logger,
+  OnModuleInit,
 } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 import { createHash, randomBytes } from 'crypto';
-import {
-  IntegrationRecord,
-  IntegrationType,
-  SaveRedirectDto,
-} from './integration.dto';
+import { IntegrationRecord, IntegrationType, SaveRedirectDto } from './integration.dto';
+import { Integration, IntegrationDocument } from './integration.schema';
 
 type RedirectRecord = {
   redirectUrl: string;
@@ -18,17 +20,44 @@ type RedirectRecord = {
 
 type OAuthStateRecord = {
   ownerId: string;
+  userId: string;
   type: IntegrationType;
   expiresAt: number;
 };
 
 @Injectable()
-export class IntegrationService {
+export class IntegrationService implements OnModuleInit {
+  private readonly logger = new Logger(IntegrationService.name);
   private readonly allowedTypes = new Set<IntegrationType>(['GOOGLE_DRIVE']);
-  private readonly integrations = new Map<string, IntegrationRecord>();
   private readonly oauthStates = new Map<string, OAuthStateRecord>();
   private readonly redirects = new Map<string, RedirectRecord>();
   private readonly rateLimits = new Map<string, { count: number; resetAt: number }>();
+
+  constructor(
+    @InjectModel(Integration.name)
+    private readonly integrationModel: Model<IntegrationDocument>,
+  ) {}
+
+  async onModuleInit() {
+    // Remove legacy single-account index if it exists so one workspace can link multiple Google accounts.
+    try {
+      const indexes = await this.integrationModel.collection.indexes();
+      const legacyIndex = indexes.find(
+        (index) =>
+          index?.unique === true &&
+          index?.key?.ownerId === 1 &&
+          index?.key?.type === 1 &&
+          !Object.prototype.hasOwnProperty.call(index?.key, 'userId'),
+      );
+
+      if (legacyIndex?.name) {
+        await this.integrationModel.collection.dropIndex(legacyIndex.name);
+        this.logger.log(`Dropped legacy index: ${legacyIndex.name}`);
+      }
+    } catch (error: any) {
+      this.logger.warn(`Index migration skipped: ${error?.message ?? 'unknown error'}`);
+    }
+  }
 
   verifyType(type: string): asserts type is IntegrationType {
     if (!this.allowedTypes.has(type as IntegrationType)) {
@@ -45,9 +74,10 @@ export class IntegrationService {
     return { success: true };
   }
 
-  storeOAuthState(state: string, ownerId: string, type: IntegrationType) {
+  storeOAuthState(state: string, ownerId: string, userId: string, type: IntegrationType) {
     this.oauthStates.set(state, {
       ownerId,
+      userId,
       type,
       expiresAt: Date.now() + 5 * 60_000,
     });
@@ -68,65 +98,121 @@ export class IntegrationService {
     return record;
   }
 
-  saveIntegrationDB(integrationData: {
+  async saveIntegrationDB(integrationData: {
     ownerId: string;
+    userId: string;
     type: IntegrationType;
     tokens: IntegrationRecord['tokens'];
     info?: string;
   }) {
-    const { ownerId, type, tokens, info } = integrationData;
+    const { ownerId, userId, type, tokens, info } = integrationData;
+    const normalizedEmail = this.normalizeEmail(info);
 
-    const record: IntegrationRecord = {
+    const updatePayload = {
       ownerId,
+      userId,
       type,
-      tokens: {
-        accessToken: this.encryptToken(tokens.accessToken),
-        refreshToken: tokens.refreshToken
-          ? this.encryptToken(tokens.refreshToken)
-          : undefined,
-        scope: tokens.scope,
-        expiryDate: tokens.expiryDate,
-      },
-      info,
+      encryptedAccessToken: this.encryptToken(tokens.accessToken),
+      encryptedRefreshToken: tokens.refreshToken ? this.encryptToken(tokens.refreshToken) : null,
+      scope: tokens.scope ?? null,
+      expiryDate: tokens.expiryDate ?? null,
+      info: normalizedEmail,
       isActive: true,
       isDeleted: false,
-      updatedAt: new Date().toISOString(),
     };
 
-    this.integrations.set(this.key(ownerId, type), record);
-    return record;
+    try {
+      const saved = await this.integrationModel
+        .findOneAndUpdate(
+          { ownerId, userId, type, info: normalizedEmail },
+          { $set: updatePayload },
+          { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true },
+        )
+        .lean();
+
+      if (!saved) {
+        throw new InternalServerErrorException('Unable to save integration');
+      }
+
+      return this.mapDocumentToRecord(saved as IntegrationDocument);
+    } catch (error: any) {
+      if (error?.code === 11000) {
+        throw new BadRequestException('This Google email is already linked for this user.');
+      }
+      throw error;
+    }
   }
 
-  getTokenOrApiKey({ ownerId, type }: { ownerId: string; type: IntegrationType }) {
-    const integration = this.integrations.get(this.key(ownerId, type));
+  async getTokenOrApiKey({
+    ownerId,
+    type,
+    userId,
+    integrationId,
+    email,
+  }: {
+    ownerId: string;
+    type: IntegrationType;
+    userId?: string;
+    integrationId?: string;
+    email?: string;
+  }) {
+    const query: Record<string, unknown> = {
+      ownerId,
+      type,
+      isActive: true,
+      isDeleted: false,
+    };
 
-    if (!integration || !integration.isActive || integration.isDeleted) {
+    if (integrationId) {
+      query._id = integrationId;
+    }
+
+    if (userId) {
+      query.userId = userId;
+    }
+
+    if (email) {
+      query.info = this.normalizeEmail(email);
+    }
+
+    const integration = await this.integrationModel
+      .findOne(query)
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    if (!integration) {
       throw new BadRequestException('Integration not connected');
     }
 
-    return {
-      ...integration,
-      tokens: {
-        accessToken: this.decryptToken(integration.tokens.accessToken),
-        refreshToken: integration.tokens.refreshToken
-          ? this.decryptToken(integration.tokens.refreshToken)
-          : undefined,
-        scope: integration.tokens.scope,
-        expiryDate: integration.tokens.expiryDate,
-      },
-    };
+    return this.mapDocumentToRecord(integration as IntegrationDocument);
   }
 
-  getConnectedIntergrations(ownerId: string) {
-    const items: Array<{ type: IntegrationType; isActive: boolean; updatedAt: string }> = [];
+  async getConnectedIntergrations(ownerId: string, userId?: string) {
+    const query: Record<string, unknown> = { ownerId, isActive: true, isDeleted: false };
 
-    for (const value of this.integrations.values()) {
-      if (value.ownerId === ownerId && value.isActive && !value.isDeleted) {
-        items.push({ type: value.type, isActive: value.isActive, updatedAt: value.updatedAt });
-      }
+    if (userId) {
+      query.userId = userId;
     }
 
-    return items;
+    const integrations = await this.integrationModel
+      .find(query)
+      .select({ _id: 1, userId: 1, type: 1, info: 1, isActive: 1, updatedAt: 1 })
+      .lean();
+
+    return integrations.map((item) => {
+      const raw = item as unknown as Record<string, any>;
+
+      return {
+        id: String(raw._id),
+        userId: raw.userId,
+        type: raw.type as IntegrationType,
+        info: raw.info,
+        isActive: Boolean(raw.isActive),
+        updatedAt: raw.updatedAt
+          ? new Date(raw.updatedAt).toISOString()
+          : new Date().toISOString(),
+      };
+    });
   }
 
   enforceRateLimit(key: string, limit = 40, windowMs = 60_000) {
@@ -149,8 +235,29 @@ export class IntegrationService {
     return randomBytes(24).toString('base64url');
   }
 
-  private key(ownerId: string, type: IntegrationType): string {
-    return `${ownerId}:${type}`;
+  private mapDocumentToRecord(doc: IntegrationDocument | Record<string, any>): IntegrationRecord {
+    const rawDoc = doc as Record<string, any>;
+
+    return {
+      id: rawDoc._id ? String(rawDoc._id) : undefined,
+      ownerId: rawDoc.ownerId,
+      userId: rawDoc.userId,
+      type: rawDoc.type,
+      tokens: {
+        accessToken: this.decryptToken(rawDoc.encryptedAccessToken),
+        refreshToken: rawDoc.encryptedRefreshToken ? this.decryptToken(rawDoc.encryptedRefreshToken) : undefined,
+        scope: rawDoc.scope ?? undefined,
+        expiryDate: rawDoc.expiryDate ?? undefined,
+      },
+      info: rawDoc.info ?? '',
+      isActive: Boolean(rawDoc.isActive),
+      isDeleted: Boolean(rawDoc.isDeleted),
+      updatedAt: rawDoc.updatedAt ? new Date(rawDoc.updatedAt).toISOString() : new Date().toISOString(),
+    };
+  }
+
+  private normalizeEmail(value?: string) {
+    return (value ?? '').trim().toLowerCase();
   }
 
   private encryptToken(value: string): string {
