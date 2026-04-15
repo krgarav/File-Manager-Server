@@ -22,7 +22,24 @@ type UploadedFile = {
 };
 
 type DriveItem = drive_v3.Schema$File;
-type AccountSelector = { userId?: string; integrationId?: string; email?: string };
+type AccountSelector = { userId: string; integrationId?: string; email?: string };
+
+type LinkedIntegration = {
+  id: string;
+  type: 'GOOGLE_DRIVE';
+  info?: string;
+  isActive: boolean;
+  updatedAt: string;
+  userId: string;
+};
+
+type AccountContext = {
+  ownerId: string;
+  userId: string;
+  integration: LinkedIntegration;
+  accountFolderName: string;
+  subPath: string;
+};
 
 @Injectable()
 export class FileManagerService {
@@ -36,7 +53,7 @@ export class FileManagerService {
     );
   }
 
-  async fileOperations(workspace: string, body: OperationBody, selector: AccountSelector = {}) {
+  async fileOperations(workspace: string, body: OperationBody, selector: AccountSelector) {
     const action = (body?.action ?? '').toLowerCase();
 
     switch (action) {
@@ -59,13 +76,14 @@ export class FileManagerService {
     }
   }
 
-  async getImage(workspace: string, pathValue: string, id?: string, selector: AccountSelector = {}) {
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
+  async getImage(workspace: string, pathValue: string, id: string | undefined, selector: AccountSelector) {
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
 
     let fileId = id ?? '';
     if (!fileId) {
-      const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
-      const name = this.getLeafName(pathValue);
+      const parentId = await this.resolvePathToFolderId(account, selector);
+      const name = this.getLeafName(account.subPath);
       if (!name) {
         throw new BadRequestException('Image identifier is missing');
       }
@@ -77,11 +95,7 @@ export class FileManagerService {
       fileId = file.id;
     }
 
-    const response = await drive.files.get(
-      { fileId, alt: 'media' },
-      { responseType: 'stream' },
-    );
-
+    const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
     const meta = await drive.files.get({ fileId, fields: 'id,name,mimeType' });
 
     return {
@@ -91,13 +105,14 @@ export class FileManagerService {
     };
   }
 
-  async saveUpload(workspace: string, pathValue: string, files: UploadedFile[], selector: AccountSelector = {}) {
+  async saveUpload(workspace: string, pathValue: string, files: UploadedFile[], selector: AccountSelector) {
     if (!files?.length) {
       throw new BadRequestException('No files uploaded');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const parentId = await this.resolvePathToFolderId(account, selector);
 
     for (const file of files) {
       const safeName = (file.originalname || file.filename || 'file').trim();
@@ -118,26 +133,24 @@ export class FileManagerService {
       });
     }
 
-    return this.read(workspace, pathValue || '/', selector);
+    return this.read(workspace, pathValue, selector);
   }
 
-  async getDownloadStream(workspace: string, pathValue: string, names: string[], selector: AccountSelector = {}) {
+  async getDownloadStream(workspace: string, pathValue: string, names: string[], selector: AccountSelector) {
     if (!names?.length) {
       throw new BadRequestException('No file selected for download');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const parentId = await this.resolvePathToFolderId(account, selector);
     const target = await this.findItemByName(drive, parentId, names[0]);
 
     if (!target?.id || target.mimeType === 'application/vnd.google-apps.folder') {
       throw new BadRequestException('Only file download is supported');
     }
 
-    const response = await drive.files.get(
-      { fileId: target.id, alt: 'media' },
-      { responseType: 'stream' },
-    );
+    const response = await drive.files.get({ fileId: target.id, alt: 'media' }, { responseType: 'stream' });
 
     return {
       stream: response.data as NodeJS.ReadableStream,
@@ -146,9 +159,17 @@ export class FileManagerService {
     };
   }
 
-  private async read(workspace: string, pathValue: string, selector: AccountSelector = {}) {
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const currentFolderId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+  private async read(workspace: string, pathValue: string, selector: AccountSelector) {
+    const ownerId = this.normalizeWorkspace(workspace);
+    const normalizedPath = this.normalizePath(pathValue);
+
+    if (normalizedPath === '/') {
+      return this.readRoot(ownerId, selector.userId);
+    }
+
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(ownerId, selector.userId, account.integration.id);
+    const currentFolderId = await this.resolvePathToFolderId(account, selector);
 
     const listResponse = await drive.files.list({
       q: `'${currentFolderId}' in parents and trashed=false`,
@@ -156,11 +177,10 @@ export class FileManagerService {
       pageSize: 1000,
     });
 
-    const files = (listResponse.data.files ?? []).map((item) => this.mapDriveItem(item, pathValue));
+    const virtualPath = this.composeVirtualPath(account.accountFolderName, account.subPath);
+    const files = (listResponse.data.files ?? []).map((item) => this.mapDriveItem(item, virtualPath));
 
-    const cwdName = this.normalizePath(pathValue) === '/'
-      ? `Google Drive (${workspace})`
-      : this.getLeafName(pathValue) || `Google Drive (${workspace})`;
+    const cwdName = account.subPath === '/' ? account.accountFolderName : this.getLeafName(account.subPath);
 
     return {
       cwd: {
@@ -169,16 +189,44 @@ export class FileManagerService {
         isFile: false,
         hasChild: true,
         type: '',
-        filterPath: this.parentPath(pathValue),
+        filterPath: this.parentPath(virtualPath),
       },
       files,
       error: null,
     };
   }
 
-  private async createFolder(workspace: string, pathValue: string, name: string, selector: AccountSelector = {}) {
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+  private async readRoot(ownerId: string, userId: string) {
+    const linked = await this.getLinkedIntegrations(ownerId, userId);
+
+    return {
+      cwd: {
+        id: 'root',
+        name: `Google Drive Accounts (${linked.length})`,
+        isFile: false,
+        hasChild: linked.length > 0,
+        type: '',
+        filterPath: '/',
+      },
+      files: linked.map((item) => ({
+        id: item.id,
+        name: this.getAccountFolderName(item),
+        isFile: false,
+        size: 0,
+        dateModified: item.updatedAt,
+        dateCreated: item.updatedAt,
+        hasChild: true,
+        type: '',
+        filterPath: '/',
+      })),
+      error: null,
+    };
+  }
+
+  private async createFolder(workspace: string, pathValue: string, name: string, selector: AccountSelector) {
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const parentId = await this.resolvePathToFolderId(account, selector);
     const safeName = name.trim();
 
     if (!safeName) {
@@ -200,13 +248,16 @@ export class FileManagerService {
     return this.read(workspace, pathValue, selector);
   }
 
-  private async deleteItems(workspace: string, pathValue: string, names: string[], selector: AccountSelector = {}) {
+  private async deleteItems(workspace: string, pathValue: string, names: string[], selector: AccountSelector) {
+    this.rejectRootMutation(pathValue);
+
     if (!names.length) {
       throw new BadRequestException('No file or folder selected');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const parentId = await this.resolvePathToFolderId(account, selector);
 
     for (const name of names) {
       const item = await this.findItemByName(drive, parentId, name);
@@ -218,7 +269,9 @@ export class FileManagerService {
     return this.read(workspace, pathValue, selector);
   }
 
-  private async renameItem(workspace: string, pathValue: string, currentName: string, newName: string, selector: AccountSelector = {}) {
+  private async renameItem(workspace: string, pathValue: string, currentName: string, newName: string, selector: AccountSelector) {
+    this.rejectRootMutation(pathValue);
+
     const safeCurrent = currentName.trim();
     const safeNew = newName.trim();
 
@@ -226,8 +279,9 @@ export class FileManagerService {
       throw new BadRequestException('Both current and new names are required');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const parentId = await this.resolvePathToFolderId(account, selector);
     const source = await this.findItemByName(drive, parentId, safeCurrent);
 
     if (!source?.id) {
@@ -243,14 +297,24 @@ export class FileManagerService {
     return this.read(workspace, pathValue, selector);
   }
 
-  private async copyItems(workspace: string, pathValue: string, targetPath: string, names: string[], selector: AccountSelector = {}) {
+  private async copyItems(workspace: string, pathValue: string, targetPath: string, names: string[], selector: AccountSelector) {
+    this.rejectRootMutation(pathValue);
+    this.rejectRootMutation(targetPath);
+
     if (!names.length) {
       throw new BadRequestException('No file or folder selected');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const sourceParentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
-    const targetParentId = await this.resolvePathToFolderId(workspace, targetPath, selector);
+    const sourceAccount = await this.resolveAccountContext(workspace, pathValue, selector);
+    const targetAccount = await this.resolveAccountContext(workspace, targetPath, selector);
+
+    if (sourceAccount.integration.id !== targetAccount.integration.id) {
+      throw new BadRequestException('Copy across different Google accounts is not supported.');
+    }
+
+    const { drive } = await this.getWorkspaceDrive(sourceAccount.ownerId, sourceAccount.userId, sourceAccount.integration.id);
+    const sourceParentId = await this.resolvePathToFolderId(sourceAccount, selector);
+    const targetParentId = await this.resolvePathToFolderId(targetAccount, selector);
 
     for (const name of names) {
       const item = await this.findItemByName(drive, sourceParentId, name);
@@ -275,14 +339,24 @@ export class FileManagerService {
     return this.read(workspace, targetPath, selector);
   }
 
-  private async moveItems(workspace: string, pathValue: string, targetPath: string, names: string[], selector: AccountSelector = {}) {
+  private async moveItems(workspace: string, pathValue: string, targetPath: string, names: string[], selector: AccountSelector) {
+    this.rejectRootMutation(pathValue);
+    this.rejectRootMutation(targetPath);
+
     if (!names.length) {
       throw new BadRequestException('No file or folder selected');
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const sourceParentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
-    const targetParentId = await this.resolvePathToFolderId(workspace, targetPath, selector);
+    const sourceAccount = await this.resolveAccountContext(workspace, pathValue, selector);
+    const targetAccount = await this.resolveAccountContext(workspace, targetPath, selector);
+
+    if (sourceAccount.integration.id !== targetAccount.integration.id) {
+      throw new BadRequestException('Move across different Google accounts is not supported.');
+    }
+
+    const { drive } = await this.getWorkspaceDrive(sourceAccount.ownerId, sourceAccount.userId, sourceAccount.integration.id);
+    const sourceParentId = await this.resolvePathToFolderId(sourceAccount, selector);
+    const targetParentId = await this.resolvePathToFolderId(targetAccount, selector);
 
     for (const name of names) {
       const item = await this.findItemByName(drive, sourceParentId, name);
@@ -301,13 +375,14 @@ export class FileManagerService {
     return this.read(workspace, targetPath, selector);
   }
 
-  private async getDetails(workspace: string, pathValue: string, names: string[], selector: AccountSelector = {}) {
+  private async getDetails(workspace: string, pathValue: string, names: string[], selector: AccountSelector) {
     if (!names.length) {
       return { details: null, error: null };
     }
 
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const parentId = await this.resolvePathToFolderId(workspace, pathValue, selector);
+    const account = await this.resolveAccountContext(workspace, pathValue, selector);
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const parentId = await this.resolvePathToFolderId(account, selector);
     const item = await this.findItemByName(drive, parentId, names[0]);
 
     if (!item) {
@@ -322,23 +397,18 @@ export class FileManagerService {
         isFile: item.mimeType !== 'application/vnd.google-apps.folder',
         dateModified: item.modifiedTime ?? null,
         dateCreated: item.createdTime ?? null,
-        type: item.mimeType === 'application/vnd.google-apps.folder'
-          ? ''
-          : extname(item.name ?? ''),
+        type: item.mimeType === 'application/vnd.google-apps.folder' ? '' : extname(item.name ?? ''),
       },
       error: null,
     };
   }
 
-  private async getWorkspaceDrive(workspace: string, selector: AccountSelector = {}) {
-    const ownerId = this.normalizeWorkspace(workspace);
-
+  private async getWorkspaceDrive(ownerId: string, userId: string, integrationId: string) {
     const integrationData = await this.integrationService.getTokenOrApiKey({
       ownerId,
       type: 'GOOGLE_DRIVE',
-      userId: selector.userId,
-      integrationId: selector.integrationId,
-      email: selector.email,
+      userId,
+      integrationId,
     });
 
     this.oAuth2Client.setCredentials({
@@ -347,33 +417,137 @@ export class FileManagerService {
     });
 
     return {
-      ownerId,
       drive: google.drive({ version: 'v3', auth: this.oAuth2Client }),
     };
   }
 
-  private async resolvePathToFolderId(workspace: string, pathValue: string, selector: AccountSelector = {}) {
-    const { drive } = await this.getWorkspaceDrive(workspace, selector);
-    const rootName = this.getWorkspaceRootName(workspace);
-    const workspaceRoot = await this.ensureFolder(drive, 'root', rootName);
+  private async resolveAccountContext(workspace: string, pathValue: string, selector: AccountSelector): Promise<AccountContext> {
+    const ownerId = this.normalizeWorkspace(workspace);
+    const userId = this.normalizeUserId(selector.userId);
+    const linked = await this.getLinkedIntegrations(ownerId, userId);
+
+    if (!linked.length) {
+      throw new BadRequestException('No Google Drive accounts linked for this user.');
+    }
 
     const normalizedPath = this.normalizePath(pathValue);
+
+    if (selector.integrationId || selector.email) {
+      const integration = linked.find((item) => {
+        if (selector.integrationId && item.id === selector.integrationId) {
+          return true;
+        }
+        if (selector.email && (item.info || '').toLowerCase() === selector.email.toLowerCase()) {
+          return true;
+        }
+        return false;
+      });
+
+      if (!integration) {
+        throw new BadRequestException('Selected Google account was not found for this user.');
+      }
+
+      const segments = normalizedPath.split('/').filter(Boolean);
+      const accountFolderName = this.getAccountFolderName(integration);
+      const hasAccountPrefix =
+        segments[0] === integration.id || segments[0] === accountFolderName;
+      const subSegments = hasAccountPrefix ? segments.slice(1) : segments;
+      const subPath = subSegments.length ? `/${subSegments.join('/')}` : '/';
+
+      return {
+        ownerId,
+        userId,
+        integration,
+        accountFolderName,
+        subPath,
+      };
+    }
+
     if (normalizedPath === '/') {
-      return workspaceRoot.id as string;
+      throw new BadRequestException('Please open a linked Google account folder first.');
     }
 
     const segments = normalizedPath.split('/').filter(Boolean);
+    const accountSegment = segments[0];
+    const integration = linked.find(
+      (item) =>
+        item.id === accountSegment ||
+        this.getAccountFolderName(item) === accountSegment,
+    );
+
+    if (!integration) {
+      throw new BadRequestException(`Google account folder not found: ${accountSegment}`);
+    }
+
+    const subSegments = segments.slice(1);
+    const subPath = subSegments.length ? `/${subSegments.join('/')}` : '/';
+    const accountFolderName = this.getAccountFolderName(integration);
+
+    return {
+      ownerId,
+      userId,
+      integration,
+      accountFolderName,
+      subPath,
+    };
+  }
+
+  private async resolvePathToFolderId(account: AccountContext, selector: AccountSelector) {
+    const { drive } = await this.getWorkspaceDrive(account.ownerId, account.userId, account.integration.id);
+    const rootName = this.getWorkspaceRootName(account.ownerId);
+    const workspaceRoot = await this.ensureFolder(drive, 'root', rootName);
+
+    if (account.subPath === '/') {
+      return workspaceRoot.id as string;
+    }
+
+    const segments = account.subPath.split('/').filter(Boolean);
     let currentParentId = workspaceRoot.id as string;
 
     for (const segment of segments) {
-      const folder = await this.findItemByName(drive, currentParentId, segment);
-      if (!folder?.id || folder.mimeType !== 'application/vnd.google-apps.folder') {
+      const folderId = await this.resolveFolderSegment(drive, currentParentId, segment);
+      if (!folderId) {
         throw new BadRequestException(`Folder not found: ${segment}`);
       }
-      currentParentId = folder.id;
+      currentParentId = folderId;
     }
 
     return currentParentId;
+  }
+
+  private async resolveFolderSegment(
+    drive: drive_v3.Drive,
+    parentId: string,
+    segment: string,
+  ): Promise<string | null> {
+    // Syncfusion can send either folder names or folder ids in path segments.
+    try {
+      const byId = await drive.files.get({
+        fileId: segment,
+        fields: 'id,mimeType,parents,trashed',
+      });
+      const parentIds = byId.data.parents ?? [];
+      const isFolder = byId.data.mimeType === 'application/vnd.google-apps.folder';
+      if (!byId.data.trashed && isFolder && parentIds.includes(parentId)) {
+        return byId.data.id ?? null;
+      }
+    } catch {
+      // Not an id in this account context, fallback to name lookup.
+    }
+
+    const byName = await this.findItemByName(drive, parentId, segment);
+    if (byName?.id && byName.mimeType === 'application/vnd.google-apps.folder') {
+      return byName.id;
+    }
+
+    return null;
+  }
+
+  private async getLinkedIntegrations(ownerId: string, userId: string) {
+    const data = await this.integrationService.getConnectedIntergrations(ownerId, userId);
+    return data
+      .filter((item) => item.type === 'GOOGLE_DRIVE' && item.isActive)
+      .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)) as LinkedIntegration[];
   }
 
   private async ensureFolder(drive: drive_v3.Drive, parentId: string, name: string) {
@@ -428,8 +602,27 @@ export class FileManagerService {
       dateCreated: item.createdTime ?? null,
       hasChild: isFolder,
       type: isFolder ? '' : extname(item.name ?? ''),
-      filterPath: this.normalizePath(pathValue),
+      // Syncfusion expects folder paths like "/a/b/" (trailing slash), otherwise UI tree lookup can fail.
+      filterPath: this.normalizeFilterPath(pathValue),
     };
+  }
+
+  private rejectRootMutation(pathValue: string) {
+    if (this.normalizePath(pathValue) === '/') {
+      throw new BadRequestException('Open a Google account folder before performing this action.');
+    }
+  }
+
+  private getAccountFolderName(integration: LinkedIntegration) {
+    return (integration.info || '').trim() || `account-${integration.id.slice(-6)}`;
+  }
+
+  private composeVirtualPath(accountFolderName: string, subPath: string) {
+    if (subPath === '/') {
+      return `/${accountFolderName}`;
+    }
+
+    return `/${accountFolderName}${subPath}`;
   }
 
   private normalizeWorkspace(workspace: string) {
@@ -439,6 +632,17 @@ export class FileManagerService {
     }
     if (normalized.length > 120) {
       throw new BadRequestException('workspace is too long');
+    }
+    return normalized;
+  }
+
+  private normalizeUserId(userId?: string) {
+    const normalized = (userId ?? '').trim();
+    if (!normalized) {
+      throw new BadRequestException('userId is required');
+    }
+    if (normalized.length > 120) {
+      throw new BadRequestException('userId is too long');
     }
     return normalized;
   }
@@ -455,6 +659,15 @@ export class FileManagerService {
   private normalizePath(pathValue: string) {
     const pathString = `/${(pathValue ?? '/').replace(/\\/g, '/').replace(/^\/+/, '')}`;
     return pathString.replace(/\/+/g, '/');
+  }
+
+  private normalizeFilterPath(pathValue: string) {
+    const normalized = this.normalizePath(pathValue);
+    if (normalized === '/') {
+      return '/';
+    }
+
+    return normalized.endsWith('/') ? normalized : `${normalized}/`;
   }
 
   private parentPath(pathValue: string) {

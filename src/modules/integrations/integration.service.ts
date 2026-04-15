@@ -188,7 +188,15 @@ export class IntegrationService implements OnModuleInit {
   }
 
   async getConnectedIntergrations(ownerId: string, userId?: string) {
-    const query: Record<string, unknown> = { ownerId, isActive: true, isDeleted: false };
+    return this.getIntegrations(ownerId, userId, false);
+  }
+
+  async getIntegrations(ownerId: string, userId?: string, includeInactive = true) {
+    const query: Record<string, unknown> = { ownerId, isDeleted: false };
+
+    if (!includeInactive) {
+      query.isActive = true;
+    }
 
     if (userId) {
       query.userId = userId;
@@ -197,6 +205,7 @@ export class IntegrationService implements OnModuleInit {
     const integrations = await this.integrationModel
       .find(query)
       .select({ _id: 1, userId: 1, type: 1, info: 1, isActive: 1, updatedAt: 1 })
+      .sort({ updatedAt: -1 })
       .lean();
 
     return integrations.map((item) => {
@@ -213,6 +222,47 @@ export class IntegrationService implements OnModuleInit {
           : new Date().toISOString(),
       };
     });
+  }
+
+  async setIntegrationStatus(params: {
+    ownerId: string;
+    userId: string;
+    integrationId: string;
+    isActive: boolean;
+  }) {
+    const integrationId = (params.integrationId ?? '').trim();
+    if (!integrationId) {
+      throw new BadRequestException('integrationId is required');
+    }
+
+    const updated = await this.integrationModel
+      .findOneAndUpdate(
+        {
+          _id: integrationId,
+          ownerId: params.ownerId,
+          userId: params.userId,
+          isDeleted: false,
+        },
+        { $set: { isActive: Boolean(params.isActive) } },
+        { returnDocument: 'after' },
+      )
+      .lean();
+
+    if (!updated) {
+      throw new BadRequestException('Integration not found for this user');
+    }
+
+    const raw = updated as unknown as Record<string, any>;
+    return {
+      id: String(raw._id),
+      userId: raw.userId,
+      type: raw.type as IntegrationType,
+      info: raw.info,
+      isActive: Boolean(raw.isActive),
+      updatedAt: raw.updatedAt
+        ? new Date(raw.updatedAt).toISOString()
+        : new Date().toISOString(),
+    };
   }
 
   enforceRateLimit(key: string, limit = 40, windowMs = 60_000) {
